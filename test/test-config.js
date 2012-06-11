@@ -6,4 +6,4 @@ exports.user = '<user>';
 exports.pwd = '<pwd>';
 
 // location of mocha module
-exports.mocha = '../../node_modules/mocha/bin/mocha';
+exports.mocha = 'mocha/bin/mocha';
