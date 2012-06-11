@@ -4,6 +4,3 @@
 exports.server = '.\\SQL2008R2';
 exports.user = '<user>';
 exports.pwd = '<pwd>';
-
-// location of mocha module
-exports.mocha = 'mocha/bin/mocha';
