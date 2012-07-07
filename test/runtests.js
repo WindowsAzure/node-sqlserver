@@ -19,7 +19,7 @@ var config = require('./test-config');
 
 var fileContent;
 var root = false;
-if (path.existsSync('./testlist.txt')) {
+if (fs.existsSync('./testlist.txt')) {
   fileContent = fs.readFileSync('./testlist.txt').toString();
 } else {
   fileContent = fs.readFileSync('./test/testlist.txt').toString();
