@@ -3,7 +3,7 @@
   "description": "Microsoft Driver for Node.js for SQL Server",
   "author": "Microsoft Corp.",
   "contributors": [ "Jonathan Guerin <jguerin@microsoft.com>", "Jay Kint <jkint@microsoft.com>", "Warren Read <wread@microsoft.com>", "George Yan <georgeya@microsoft.com>", "Inga Verbitskaya <ingave@microsoft.com>"],
-  "version": "0.1.0",
+  "version": "0.1.1",
   "keywords": ["sql", "database", "mssql", "azure", "sqlserver", "tds"],
   "homepage": "https://github.com/WindowsAzure/node-sqlserver",
   "bugs": "https://github.com/WindowsAzure/node-sqlserver/issues",
@@ -19,10 +19,10 @@
     "url": "git://github.com/WindowsAzure/node-sqlserver.git" 
   },
   "engines": {
-    "node": "0.6"
+    "node": "0.8"
   },
   "devDependencies": {
-     "mocha" : "0.14.x",
+     "mocha": "~1.3.0",
      "async" : "0.1.x"
   }
 }
