@@ -2,7 +2,7 @@
 // File: stdafx.h
 // Contents: Precompiled header
 // 
-// Copyright Microsoft Corporation
+// Copyright Microsoft Corporation and contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,6 +26,8 @@
 
 #include <sqlucode.h>
 
+#include <windows.h>	// for critical section until xplatform
+
 #include <vector>
 #include <queue>
 #include <string>
@@ -36,5 +38,15 @@
 #include "Utility.h"
 #include "OdbcException.h"
 #include "OdbcHandle.h"
+
+#define interface struct 	// for the COM interfaces in sqlncli.h and to avoid including extra files
+#include "sqlncli.h"	 	// SQL Server specific constants
+
+// default values filled in for a JS date object when retrieving a SQL Server time field
+// There is no default JS date when only a time is furnished, so we are using the SQL Server
+// defaults, which is Jan 1, 1900.
+const int SQL_SERVER_DEFAULT_YEAR  = 1900;
+const int SQL_SERVER_DEFAULT_MONTH = 0;		// JS months are 0 based
+const int SQL_SERVER_DEFAULT_DAY   = 1;
 
 #define ErrorIf(x) if (x) goto Error;

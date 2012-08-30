@@ -2,7 +2,7 @@
 // File: OdbcConnection.cpp
 // Contents: Async calls to ODBC done in background thread
 // 
-// Copyright Microsoft Corporation
+// Copyright Microsoft Corporation and contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,9 +20,27 @@
 #include "stdafx.h"
 #include "OdbcConnection.h"
 
+#pragma intrinsic( memset )
+
 namespace mssql
 {
     OdbcEnvironmentHandle OdbcConnection::environment;
+
+    // bind all the parameters in the array
+    // for now they are all treated as input parameters
+    void OdbcConnection::BindParams( QueryOperation::param_bindings& params )
+    {
+        int current_param = 1;
+        for( QueryOperation::param_bindings::iterator i = params.begin(); i != params.end(); ++i ) {
+
+            SQLRETURN r = SQLBindParameter( statement, current_param++, SQL_PARAM_INPUT, i->c_type, i->sql_type, i->param_size, 
+                                            i->digits, i->buffer, i->buffer_len, &i->indptr );
+            // no need to check for SQL_STILL_EXECUTING
+            if( !SQL_SUCCEEDED( r )) {
+                statement.Throw();
+            }
+        }
+    }
 
     void OdbcConnection::InitializeEnvironment()
     {
@@ -37,97 +55,8 @@ namespace mssql
         if (!SQL_SUCCEEDED(ret)) { throw OdbcException::Create(SQL_HANDLE_ENV, environment); }
     }
 
-    bool OdbcConnection::TryClose()
+    bool OdbcConnection::StartReadingResults()
     {
-        if (connectionState != Closed)
-        {
-            SQLRETURN ret = SQLDisconnect(connection);
-            if (ret == SQL_STILL_EXECUTING) 
-            { 
-                return false; 
-            }
-            if (!SQL_SUCCEEDED(ret)) 
-            { 
-                connection.Throw();  
-            }
-
-            statement.Free();
-            connection.Free();
-            connectionState = Closed;
-        }
-
-        return true;
-    }
-
-    bool OdbcConnection::TryOpen(const wstring& connectionString)
-    {
-        SQLRETURN ret;
-
-        if (connectionState == Closed)
-        {
-            OdbcConnectionHandle localConnection;
-
-            localConnection.Alloc(environment);
-
-            this->connection = std::move(localConnection);
-
-            // TODO: determine async open support correctly
-            // SQLSetConnectAttr(connection, SQL_ATTR_ASYNC_DBC_FUNCTIONS_ENABLE, (SQLPOINTER)SQL_ASYNC_DBC_ENABLE_ON, 0);
-
-            connectionState = Opening;
-        }
-
-        if (connectionState == Opening)
-        {
-            ret = SQLDriverConnect(connection, NULL, const_cast<wchar_t*>(connectionString.c_str()), connectionString.length(), NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
-            if (ret == SQL_STILL_EXECUTING) 
-            { 
-                return false; 
-            }
-            if (!SQL_SUCCEEDED(ret)) 
-            { 
-                connection.Throw();  
-            }
-
-            connectionState = Open;
-            return true;
-        }
-
-        throw OdbcException("Attempt to open a connection that is not closed");
-    }
-
-    bool OdbcConnection::TryExecute(const wstring& query)
-    {
-        if (connectionState != Open)
-        {
-            throw OdbcException("Unable to execute a query on a connection that is not open");
-        }
-
-        if (executionState == Idle)
-        {
-            statement.Alloc(connection);
-            
-            // ignore failure - optional attribute
-            SQLSetStmtAttr(statement, SQL_ATTR_ASYNC_ENABLE, (SQLPOINTER)SQL_ASYNC_ENABLE_ON, 0);
-
-            executionState = Executing;
-        }
-
-        if (executionState == Executing)
-        {
-            SQLRETURN ret = SQLExecDirect(statement, const_cast<wchar_t*>(query.c_str()), query.length());
-            if (ret == SQL_STILL_EXECUTING) 
-            { 
-                return false; 
-            }
-            if (!SQL_SUCCEEDED(ret)) 
-            { 
-                statement.Throw();  
-            }
-
-            executionState = CountingColumns;
-        }
-
         if (executionState == CountingColumns)
         {
             SQLSMALLINT columns;
@@ -194,14 +123,126 @@ namespace mssql
             {
                 executionState = FetchRow;
             }
-            else {
-                statement.Free();
-                executionState = Idle;
+            else 
+            {
+                executionState = NextResults;
             }
+            
             return true;
         }
 
         throw OdbcException("The connection is in an invalid state");
+    }
+
+    bool OdbcConnection::TryClose()
+    {
+        if (connectionState != Closed)  // fast fail before critical section
+        {
+            ScopedCriticalSectionLock critSecLock( closeCriticalSection );
+            if (connectionState != Closed)
+            {
+                SQLRETURN ret = SQLDisconnect(connection);
+                if (ret == SQL_STILL_EXECUTING) 
+                { 
+                    return false; 
+                }
+                if (!SQL_SUCCEEDED(ret)) 
+                { 
+                    connection.Throw();  
+                }
+
+                resultset.reset();
+                statement.Free();
+                connection.Free();
+                connectionState = Closed;
+            }
+        }
+
+        return true;
+    }
+
+    bool OdbcConnection::TryOpen(const wstring& connectionString)
+    {
+        SQLRETURN ret;
+
+        if (connectionState == Closed)
+        {
+            OdbcConnectionHandle localConnection;
+
+            localConnection.Alloc(environment);
+
+            this->connection = std::move(localConnection);
+
+            // TODO: determine async open support correctly
+            // SQLSetConnectAttr(connection, SQL_ATTR_ASYNC_DBC_FUNCTIONS_ENABLE, (SQLPOINTER)SQL_ASYNC_DBC_ENABLE_ON, 0);
+
+            connectionState = Opening;
+        }
+
+        if (connectionState == Opening)
+        {
+            ret = SQLDriverConnect(connection, NULL, const_cast<wchar_t*>(connectionString.c_str()), connectionString.length(), NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
+            if (ret == SQL_STILL_EXECUTING) 
+            { 
+                return false; 
+            }
+            if (!SQL_SUCCEEDED(ret)) 
+            { 
+                connection.Throw();  
+            }
+
+            connectionState = Open;
+            return true;
+        }
+
+        throw OdbcException("Attempt to open a connection that is not closed");
+    }
+
+    bool OdbcConnection::TryExecute( const wstring& query, QueryOperation::param_bindings& paramIt )
+    {
+        if (connectionState != Open)
+        {
+            throw OdbcException("Unable to execute a query on a connection that is not open");
+        }
+
+        if (executionState == Idle)
+        {
+            statement.Alloc(connection);
+            
+            // ignore failure - optional attribute
+            SQLSetStmtAttr(statement, SQL_ATTR_ASYNC_ENABLE, (SQLPOINTER)SQL_ASYNC_ENABLE_ON, 0);
+
+            executionState = BindingParams;
+        }
+
+        if( executionState == BindingParams ) 
+        {
+            // errors thrown directly from BindParams
+            BindParams( paramIt );
+
+            executionState = Executing;
+        }
+
+        if (executionState == Executing)
+        {
+            endOfResults = true;     // reset 
+            column = 0;
+
+            SQLRETURN ret = SQLExecDirect(statement, const_cast<wchar_t*>(query.c_str()), query.length());
+
+            if (ret == SQL_STILL_EXECUTING) 
+            { 
+                return false; 
+            }
+            if (ret != SQL_NO_DATA && !SQL_SUCCEEDED(ret)) 
+            { 
+                statement.Throw();  
+            }
+
+            executionState = CountingColumns;
+        }
+
+        return StartReadingResults();
     }
 
     bool OdbcConnection::TryReadRow()
@@ -218,14 +259,13 @@ namespace mssql
         }
         if (ret == SQL_NO_DATA) 
         { 
-            resultset->moreRows = false;
-            statement.Free();
-            executionState = Idle;
+            resultset->endOfRows = true;
+            executionState = NextResults;
             return true;
         }
         else 
         {
-            resultset->moreRows = true;
+            resultset->endOfRows = false;
         }
         if (!SQL_SUCCEEDED(ret)) 
         { 
@@ -293,8 +333,29 @@ namespace mssql
                 }
             }
             break;
-        case SQL_SMALLINT:
         case SQL_BIT:
+            {
+                long val;
+                SQLRETURN ret = SQLGetData(statement, column + 1, SQL_C_SLONG, &val, sizeof(val), &strLen_or_IndPtr);
+                if (ret == SQL_STILL_EXECUTING) 
+                { 
+                    return false; 
+                }
+                if (!SQL_SUCCEEDED(ret)) 
+                { 
+                    statement.Throw();  
+                }
+                if (strLen_or_IndPtr == SQL_NULL_DATA) 
+                {
+                    resultset->SetColumn(make_shared<NullColumn>());
+                }
+                else 
+                {
+                    resultset->SetColumn(make_shared<BoolColumn>((val != 0) ? true : false));
+                }
+            }
+            break;
+        case SQL_SMALLINT:
         case SQL_TINYINT:
         case SQL_INTEGER:
             {
@@ -394,10 +455,68 @@ namespace mssql
             break;
         // use text format form time/date/etc.. for now
         // INTERVAL TYPES? 
-        case SQL_GUID:
-        case SQL_TYPE_TIME:
         case SQL_TYPE_TIMESTAMP:
         case SQL_TYPE_DATE:
+        case SQL_SS_TIMESTAMPOFFSET:
+            {
+                SQL_SS_TIMESTAMPOFFSET_STRUCT datetime;
+                memset( &datetime, 0, sizeof( datetime ));
+
+                SQLRETURN ret = SQLGetData( statement, column + 1, SQL_C_DEFAULT, &datetime, sizeof( datetime ),
+                                            &strLen_or_IndPtr );
+                if (ret == SQL_STILL_EXECUTING) 
+                { 
+                    return false; 
+                }
+                if (!SQL_SUCCEEDED(ret)) 
+                { 
+                    statement.Throw();  
+                }
+                if (strLen_or_IndPtr == SQL_NULL_DATA) 
+                {
+                    resultset->SetColumn(make_shared<NullColumn>());
+                    break;
+                }
+
+                resultset->SetColumn( make_shared<TimestampColumn>( datetime ));
+            }
+            break;
+        case SQL_TYPE_TIME:
+        case SQL_SS_TIME2:
+            {
+                SQL_SS_TIME2_STRUCT time;
+                memset( &time, 0, sizeof( time ));
+
+                SQLRETURN ret = SQLGetData( statement, column + 1, SQL_C_DEFAULT, &time, sizeof( time ),
+                                            &strLen_or_IndPtr );
+                if (ret == SQL_STILL_EXECUTING) 
+                { 
+                    return false; 
+                }
+                if (!SQL_SUCCEEDED(ret)) 
+                { 
+                    statement.Throw();  
+                }
+                if (strLen_or_IndPtr == SQL_NULL_DATA) 
+                {
+                    resultset->SetColumn(make_shared<NullColumn>());
+                    break;
+                }
+
+                SQL_SS_TIMESTAMPOFFSET_STRUCT datetime;
+                memset( &datetime, 0, sizeof( datetime ));  // not necessary, but simple precaution
+                datetime.year = SQL_SERVER_DEFAULT_YEAR;
+                datetime.month = SQL_SERVER_DEFAULT_MONTH;
+                datetime.day = SQL_SERVER_DEFAULT_DAY;
+                datetime.hour = time.hour;
+                datetime.minute = time.minute;
+                datetime.second = time.second;
+                datetime.fraction = time.fraction;
+
+                resultset->SetColumn( make_shared<TimestampColumn>( datetime ));
+            }
+            break;
+        case SQL_GUID:
         default:
             {
                 // TODO: how to figure out the size?
@@ -422,34 +541,32 @@ namespace mssql
 
     bool OdbcConnection::TryReadNextResult()
     {
-        if (executionState == FetchRow)
-        {
-
-            SQLRETURN ret = SQLMoreResults(statement);
-            if (ret == SQL_STILL_EXECUTING) 
-            { 
-                return false; 
-            }
-            if (ret == SQL_NO_DATA) 
-            { 
-                resultset->moreRows = false;
-                statement.Free();
-                executionState = Idle;
-                return true;
-            }
-            else 
-            {
-                resultset->moreRows = true;
-            }
-            if (!SQL_SUCCEEDED(ret)) 
-            { 
-                statement.Throw();
-            }
-
-            executionState = CountingColumns;
+        if (executionState != NextResults)
+        {            
+            throw OdbcException("The connection is in an invalid state");
         }
 
-        return TryExecute(L"");
+        SQLRETURN ret = SQLMoreResults(statement);
+        if (ret == SQL_STILL_EXECUTING) 
+        { 
+            return false; 
+        }
+        if (ret == SQL_NO_DATA) 
+        { 
+            endOfResults = true;
+            statement.Free();
+            executionState = Idle;
+            return true;
+        }
+        if (!SQL_SUCCEEDED(ret)) 
+        { 
+            statement.Throw();
+        }
+
+        executionState = CountingColumns;
+        endOfResults = false;
+
+        return StartReadingResults();
     }
 
     bool OdbcConnection::TryBeginTran( void )

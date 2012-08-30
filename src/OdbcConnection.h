@@ -2,7 +2,7 @@
 // File: OdbcConnection.h
 // Contents: Async calls to ODBC done in background thread
 // 
-// Copyright Microsoft Corporation
+// Copyright Microsoft Corporation and contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@
 #pragma once
 
 #include "ResultSet.h"
+#include "CriticalSection.h"
+#include "OdbcOperation.h"
 
 namespace mssql
 {
@@ -31,6 +33,7 @@ namespace mssql
         static OdbcEnvironmentHandle environment;
         OdbcConnectionHandle connection;
         OdbcStatementHandle statement;
+        CriticalSection closeCriticalSection;
 
         enum ConnectionStates
         {
@@ -43,31 +46,40 @@ namespace mssql
         enum ExecutionStates
         {
             Idle,
+            BindingParams,
             Executing,
             CountingColumns,
             Metadata,
             CountRows,
             FetchRow,
-            FetchColumn
+            FetchColumn,
+            NextResults
         } executionState;
 
         int column;
+        bool endOfResults;
+
+        void BindParams( QueryOperation::param_bindings& params );
 
     public:
         shared_ptr<ResultSet> resultset;
 
         OdbcConnection()
             : connectionState(Closed),
-              executionState(Idle)
+              executionState(Idle),
+              column(0),
+              endOfResults(true)
         {
         }
 
         static void InitializeEnvironment();
 
+        bool StartReadingResults();
+
         bool TryBeginTran();
         bool TryClose();
         bool TryOpen(const wstring& connectionString);
-        bool TryExecute(const wstring& query);
+        bool TryExecute( const wstring& query, QueryOperation::param_bindings& paramIt );
         bool TryEndTran(SQLSMALLINT completionType);
         bool TryReadRow();
         bool TryReadColumn(int column);
@@ -79,10 +91,16 @@ namespace mssql
             return scope.Close(resultset->MetaToValue());
         }
 
-        Handle<Value> MoreRows()
+        Handle<Value> EndOfResults()
         {
             HandleScope scope;
-            return scope.Close(Boolean::New(resultset->moreRows));
+            return scope.Close( Boolean::New( endOfResults ));
+        }
+
+        Handle<Value> EndOfRows()
+        {
+            HandleScope scope;
+            return scope.Close(Boolean::New(resultset->EndOfRows()));
         }
 
         Handle<Value> GetColumnValue()
