@@ -24,5 +24,8 @@
   "devDependencies": {
      "mocha" : "0.14.x",
      "async" : "0.1.x"
+  },
+  "scripts": {
+    "install" : "node ./install.js"
   }
 }
