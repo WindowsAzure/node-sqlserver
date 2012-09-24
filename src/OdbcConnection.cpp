@@ -22,13 +22,46 @@
 
 #pragma intrinsic( memset )
 
+// convenient macro to set the error for the handle and return false
+#define RETURN_ODBC_ERROR( handle )                         \
+    {                                                       \
+        error = handle.LastError(); \
+        handle.Free();                                      \
+        return false;                                       \
+    }
+
+// boilerplate macro for checking for ODBC errors in this file
+#define CHECK_ODBC_ERROR( r, handle ) { if( !SQL_SUCCEEDED( r ) ) { RETURN_ODBC_ERROR( handle ); } }
+
+// boilerplate macro for checking if SQL_NO_DATA was returned for field data
+#define CHECK_ODBC_NO_DATA( r, handle ) {                                                                 \
+    if( r == SQL_NO_DATA ) {                                                                              \
+        error = make_shared<OdbcError>( OdbcError::NODE_SQL_NO_DATA.SqlState(), OdbcError::NODE_SQL_NO_DATA.Message(), \
+            OdbcError::NODE_SQL_NO_DATA.Code() );                                                         \
+        handle.Free();                                                                                    \
+        return false;                                                                                     \
+     } }
+
+// to use with numeric_limits below
+#undef max
+
 namespace mssql
 {
+    // internal constants
+    namespace {
+
+        // max characters within a (var)char field in SQL Server
+        const int SQL_SERVER_MAX_STRING_SIZE = 8000;
+
+        // default size to retrieve from a LOB field and we don't know the size
+        const int LOB_PACKET_SIZE = 8192;
+    }
+
     OdbcEnvironmentHandle OdbcConnection::environment;
 
     // bind all the parameters in the array
     // for now they are all treated as input parameters
-    void OdbcConnection::BindParams( QueryOperation::param_bindings& params )
+    bool OdbcConnection::BindParams( QueryOperation::param_bindings& params )
     {
         int current_param = 1;
         for( QueryOperation::param_bindings::iterator i = params.begin(); i != params.end(); ++i ) {
@@ -36,102 +69,56 @@ namespace mssql
             SQLRETURN r = SQLBindParameter( statement, current_param++, SQL_PARAM_INPUT, i->c_type, i->sql_type, i->param_size, 
                                             i->digits, i->buffer, i->buffer_len, &i->indptr );
             // no need to check for SQL_STILL_EXECUTING
-            if( !SQL_SUCCEEDED( r )) {
-                statement.Throw();
-            }
+            CHECK_ODBC_ERROR( r, statement );
         }
+
+        return true;
     }
 
-    void OdbcConnection::InitializeEnvironment()
+    bool OdbcConnection::InitializeEnvironment()
     {
         SQLRETURN ret = SQLSetEnvAttr(NULL, SQL_ATTR_CONNECTION_POOLING, (SQLPOINTER)SQL_CP_ONE_PER_HENV, 0);
-        if (!SQL_SUCCEEDED(ret)) { throw OdbcException("Unable to initialize ODBC connection pooling"); }
+        if (!SQL_SUCCEEDED(ret)) { return false; }
 
-        environment.Alloc();
+        if( !environment.Alloc() ) { return false; }
 
         ret = SQLSetEnvAttr(environment, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
-        if (!SQL_SUCCEEDED(ret)) { throw OdbcException::Create(SQL_HANDLE_ENV, environment); }
+        if (!SQL_SUCCEEDED(ret)) { return false; }
         ret = SQLSetEnvAttr(environment, SQL_ATTR_CP_MATCH, (SQLPOINTER)SQL_CP_RELAXED_MATCH, 0);
-        if (!SQL_SUCCEEDED(ret)) { throw OdbcException::Create(SQL_HANDLE_ENV, environment); }
+        if (!SQL_SUCCEEDED(ret)) { return false; }
+
+        return true;
     }
 
     bool OdbcConnection::StartReadingResults()
     {
-        if (executionState == CountingColumns)
+        SQLSMALLINT columns;
+        SQLRETURN ret = SQLNumResultCols(statement, &columns);
+        CHECK_ODBC_ERROR( ret, statement );
+
+        column = 0;
+        resultset = make_shared<ResultSet>(columns);
+
+        while (column < resultset->GetColumns())
         {
-            SQLSMALLINT columns;
-            SQLRETURN ret = SQLNumResultCols(statement, &columns);
-            if (ret == SQL_STILL_EXECUTING) 
-            { 
-                return false; 
-            }
-            if (!SQL_SUCCEEDED(ret)) 
-            { 
-                statement.Throw();  
-            }        
+            SQLSMALLINT nameLength;
+            ret = SQLDescribeCol(statement, column + 1, nullptr, 0, &nameLength, nullptr, nullptr, nullptr, nullptr);
+            CHECK_ODBC_ERROR( ret, statement );
 
-            executionState = Metadata;
-            column = 0;
-            resultset = make_shared<ResultSet>(columns);
+            ResultSet::ColumnDefinition& current = resultset->GetMetadata(column);
+            vector<wchar_t> buffer(nameLength+1);
+            ret = SQLDescribeCol(statement, column + 1, buffer.data(), nameLength+1, &nameLength, &current.dataType, &current.columnSize, &current.decimalDigits, &current.nullable);
+            CHECK_ODBC_ERROR( ret, statement );
 
+            current.name = wstring(buffer.data(), nameLength);
+
+            column++;
         }
 
-        if (executionState == Metadata)
-        {
-            while (column < resultset->GetColumns())
-            {
-                SQLSMALLINT nameLength;
-                SQLRETURN ret = SQLDescribeCol(statement, column + 1, nullptr, 0, &nameLength, nullptr, nullptr, nullptr, nullptr);
-                if (ret == SQL_STILL_EXECUTING) 
-                { 
-                    return false; 
-                }
-                if (!SQL_SUCCEEDED(ret)) 
-                { 
-                    statement.Throw();  
-                }
-                ResultSet::ColumnDefinition& current = resultset->GetMetadata(column);
-                vector<wchar_t> buffer(nameLength+1);
-                ret = SQLDescribeCol(statement, column + 1, buffer.data(), nameLength+1, &nameLength, &current.dataType, &current.columnSize, &current.decimalDigits, &current.nullable);
-                if (ret == SQL_STILL_EXECUTING) 
-                { 
-                    return false; 
-                }
-                if (!SQL_SUCCEEDED(ret)) 
-                { 
-                    statement.Throw();  
-                }
-                current.name = wstring(buffer.data(), nameLength);
+        ret = SQLRowCount(statement, &resultset->rowcount);
+        CHECK_ODBC_ERROR( ret, statement );
 
-                column++;
-            }
-
-            executionState = CountRows;
-        }
-
-        if (executionState == CountRows)
-        {
-            SQLLEN rowcount;
-            SQLRETURN ret = SQLRowCount(statement, &rowcount);
-            if (!SQL_SUCCEEDED(ret)) 
-            { 
-                statement.Throw();  
-            }
-            resultset->rowcount = rowcount;
-
-            if (resultset->GetColumns() > 0)
-            {
-                executionState = FetchRow;
-            }
-            else 
-            {
-                executionState = NextResults;
-            }
-            
-            return true;
-        }
-
-        throw OdbcException("The connection is in an invalid state");
+        return true;
     }
 
     bool OdbcConnection::TryClose()
@@ -141,15 +128,7 @@ namespace mssql
             ScopedCriticalSectionLock critSecLock( closeCriticalSection );
             if (connectionState != Closed)
             {
-                SQLRETURN ret = SQLDisconnect(connection);
-                if (ret == SQL_STILL_EXECUTING) 
-                { 
-                    return false; 
-                }
-                if (!SQL_SUCCEEDED(ret)) 
-                { 
-                    connection.Throw();  
-                }
+                SQLDisconnect(connection);
 
                 resultset.reset();
                 statement.Free();
@@ -165,81 +144,48 @@ namespace mssql
     {
         SQLRETURN ret;
 
-        if (connectionState == Closed)
-        {
-            OdbcConnectionHandle localConnection;
+        assert(connectionState == Closed );
 
-            localConnection.Alloc(environment);
+        OdbcConnectionHandle localConnection;
 
-            this->connection = std::move(localConnection);
+        if( !localConnection.Alloc(environment) ) { RETURN_ODBC_ERROR( environment ); }
 
-            // TODO: determine async open support correctly
-            // SQLSetConnectAttr(connection, SQL_ATTR_ASYNC_DBC_FUNCTIONS_ENABLE, (SQLPOINTER)SQL_ASYNC_DBC_ENABLE_ON, 0);
+        this->connection = std::move(localConnection);
 
-            connectionState = Opening;
-        }
+        ret = SQLDriverConnect(connection, NULL, const_cast<wchar_t*>(connectionString.c_str()), connectionString.length(), NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
+        CHECK_ODBC_ERROR( ret, connection );
 
-        if (connectionState == Opening)
-        {
-            ret = SQLDriverConnect(connection, NULL, const_cast<wchar_t*>(connectionString.c_str()), connectionString.length(), NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
-            if (ret == SQL_STILL_EXECUTING) 
-            { 
-                return false; 
-            }
-            if (!SQL_SUCCEEDED(ret)) 
-            { 
-                connection.Throw();  
-            }
-
-            connectionState = Open;
-            return true;
-        }
-
-        throw OdbcException("Attempt to open a connection that is not closed");
+        connectionState = Open;
+        return true;
     }
 
     bool OdbcConnection::TryExecute( const wstring& query, QueryOperation::param_bindings& paramIt )
     {
-        if (connectionState != Open)
+        assert( connectionState == Open );
+
+        // if the statement isn't already allocated
+        if( !statement )
         {
-            throw OdbcException("Unable to execute a query on a connection that is not open");
+            // allocate it
+            if( !statement.Alloc(connection) ) { RETURN_ODBC_ERROR( connection ); }
+
         }
 
-        if (executionState == Idle)
-        {
-            statement.Alloc(connection);
-            
-            // ignore failure - optional attribute
-            SQLSetStmtAttr(statement, SQL_ATTR_ASYNC_ENABLE, (SQLPOINTER)SQL_ASYNC_ENABLE_ON, 0);
-
-            executionState = BindingParams;
+        bool bound = BindParams( paramIt );
+        if( !bound ) {
+            // error already set in BindParams
+            return false;
         }
 
-        if( executionState == BindingParams ) 
-        {
-            // errors thrown directly from BindParams
-            BindParams( paramIt );
+        endOfResults = true;     // reset 
+        column = 0;
 
-            executionState = Executing;
-        }
-
-        if (executionState == Executing)
-        {
-            endOfResults = true;     // reset 
-            column = 0;
-
-            SQLRETURN ret = SQLExecDirect(statement, const_cast<wchar_t*>(query.c_str()), query.length());
-
-            if (ret == SQL_STILL_EXECUTING) 
-            { 
-                return false; 
-            }
-            if (ret != SQL_NO_DATA && !SQL_SUCCEEDED(ret)) 
-            { 
-                statement.Throw();  
-            }
-
-            executionState = CountingColumns;
+        SQLRETURN ret = SQLExecDirect(statement, const_cast<wchar_t*>(query.c_str()), query.length());
+        if (ret != SQL_NO_DATA && !SQL_SUCCEEDED(ret)) 
+        { 
+            resultset = make_shared<ResultSet>(0);
+            resultset->endOfRows = true;
+            RETURN_ODBC_ERROR( statement );
         }
 
         return StartReadingResults();
@@ -247,46 +193,26 @@ namespace mssql
 
     bool OdbcConnection::TryReadRow()
     {
-        if (executionState != FetchRow)
-        {
-            throw OdbcException("The connection is in an invalid state");
-        }
+        column = 0; // reset
 
         SQLRETURN ret = SQLFetch(statement);
-        if (ret == SQL_STILL_EXECUTING) 
-        { 
-            return false; 
-        }
         if (ret == SQL_NO_DATA) 
         { 
             resultset->endOfRows = true;
-            executionState = NextResults;
             return true;
         }
         else 
         {
             resultset->endOfRows = false;
         }
-        if (!SQL_SUCCEEDED(ret)) 
-        { 
-            statement.Throw();
-        }
+        CHECK_ODBC_ERROR( ret, statement );
 
         return true;
     }
 
     bool OdbcConnection::TryReadColumn(int column)
     {
-        if (executionState != FetchRow)
-        {
-            throw OdbcException("The connection is in an invalid state");
-        }
-
-        if (column < 0 || column >= resultset->GetColumns())
-        {
-            // TODO report an error
-            return true;
-        }
+        assert( column >= 0 && column < resultset->GetColumns() );
 
         SQLLEN strLen_or_IndPtr;
         const ResultSet::ColumnDefinition& definition = resultset->GetMetadata(column);
@@ -298,38 +224,12 @@ namespace mssql
         case SQL_WCHAR:
         case SQL_WVARCHAR:
         case SQL_WLONGVARCHAR:
+        case SQL_SS_XML:
+        case SQL_GUID:
             {
-                bool more = false;
-                wchar_t buffer[2048+1] = {0};
-                SQLRETURN ret = SQLGetData(statement, column + 1, SQL_C_WCHAR, buffer, sizeof(buffer)-sizeof(wchar_t), &strLen_or_IndPtr);
-                if (ret == SQL_STILL_EXECUTING) 
-                { 
-                    return false; 
-                }
-                if (!SQL_SUCCEEDED(ret)) 
-                { 
-                    statement.Throw();  
-                }
-                if (strLen_or_IndPtr == SQL_NULL_DATA) 
-                {
-                    resultset->SetColumn(make_shared<NullColumn>());
-                }
-                else 
-                {
-                    SQLWCHAR SQLState[6];
-                    SQLINTEGER nativeError;
-                    SQLSMALLINT textLength;
-                    if (ret == SQL_SUCCESS_WITH_INFO)
-                    {
-                        ret = SQLGetDiagRec(SQL_HANDLE_STMT, statement, 1, SQLState, &nativeError, NULL, 0, &textLength);
-                        if (!SQL_SUCCEEDED(ret)) 
-                        { 
-                            statement.Throw();  
-                        }
-                        more = wcsncmp(SQLState, L"01004", 6) == 0;
-                    }
-
-                    resultset->SetColumn(make_shared<StringColumn>(buffer, more));
+                bool read = TryReadString( false, column );
+                if( !read ) {
+                    return false;
                 }
             }
             break;
@@ -337,14 +237,7 @@ namespace mssql
             {
                 long val;
                 SQLRETURN ret = SQLGetData(statement, column + 1, SQL_C_SLONG, &val, sizeof(val), &strLen_or_IndPtr);
-                if (ret == SQL_STILL_EXECUTING) 
-                { 
-                    return false; 
-                }
-                if (!SQL_SUCCEEDED(ret)) 
-                { 
-                    statement.Throw();  
-                }
+                CHECK_ODBC_ERROR( ret, statement );
                 if (strLen_or_IndPtr == SQL_NULL_DATA) 
                 {
                     resultset->SetColumn(make_shared<NullColumn>());
@@ -361,14 +254,7 @@ namespace mssql
             {
                 long val;
                 SQLRETURN ret = SQLGetData(statement, column + 1, SQL_C_SLONG, &val, sizeof(val), &strLen_or_IndPtr);
-                if (ret == SQL_STILL_EXECUTING) 
-                { 
-                    return false; 
-                }
-                if (!SQL_SUCCEEDED(ret)) 
-                { 
-                    statement.Throw();  
-                }
+                CHECK_ODBC_ERROR( ret, statement );
                 if (strLen_or_IndPtr == SQL_NULL_DATA) 
                 {
                     resultset->SetColumn(make_shared<NullColumn>());
@@ -388,14 +274,7 @@ namespace mssql
             {
                 double val;
                 SQLRETURN ret = SQLGetData(statement, column + 1, SQL_C_DOUBLE, &val, sizeof(val), &strLen_or_IndPtr);
-                if (ret == SQL_STILL_EXECUTING) 
-                { 
-                    return false; 
-                }
-                if (!SQL_SUCCEEDED(ret)) 
-                { 
-                    statement.Throw();  
-                }
+                CHECK_ODBC_ERROR( ret, statement );
                 if (strLen_or_IndPtr == SQL_NULL_DATA) 
                 {
                     resultset->SetColumn(make_shared<NullColumn>());
@@ -413,14 +292,7 @@ namespace mssql
                 bool more = false;
                 vector<char> buffer(2048);
                 SQLRETURN ret = SQLGetData(statement, column + 1, SQL_C_BINARY, buffer.data(), buffer.size(), &strLen_or_IndPtr);
-                if (ret == SQL_STILL_EXECUTING) 
-                { 
-                    return false; 
-                }
-                if (!SQL_SUCCEEDED(ret)) 
-                { 
-                    statement.Throw();  
-                }
+                CHECK_ODBC_ERROR( ret, statement );
                 if (strLen_or_IndPtr == SQL_NULL_DATA) 
                 {
                     resultset->SetColumn(make_shared<NullColumn>());
@@ -435,10 +307,7 @@ namespace mssql
                     if (ret == SQL_SUCCESS_WITH_INFO)
                     {
                         ret = SQLGetDiagRec(SQL_HANDLE_STMT, statement, 1, SQLState, &nativeError, NULL, 0, &textLength);
-                        if (!SQL_SUCCEEDED(ret)) 
-                        { 
-                            statement.Throw();  
-                        }
+                        CHECK_ODBC_ERROR( ret, statement );
                         more = wcsncmp(SQLState, L"01004", 6) == 0;
                     }
 
@@ -464,14 +333,7 @@ namespace mssql
 
                 SQLRETURN ret = SQLGetData( statement, column + 1, SQL_C_DEFAULT, &datetime, sizeof( datetime ),
                                             &strLen_or_IndPtr );
-                if (ret == SQL_STILL_EXECUTING) 
-                { 
-                    return false; 
-                }
-                if (!SQL_SUCCEEDED(ret)) 
-                { 
-                    statement.Throw();  
-                }
+                CHECK_ODBC_ERROR( ret, statement );
                 if (strLen_or_IndPtr == SQL_NULL_DATA) 
                 {
                     resultset->SetColumn(make_shared<NullColumn>());
@@ -489,14 +351,7 @@ namespace mssql
 
                 SQLRETURN ret = SQLGetData( statement, column + 1, SQL_C_DEFAULT, &time, sizeof( time ),
                                             &strLen_or_IndPtr );
-                if (ret == SQL_STILL_EXECUTING) 
-                { 
-                    return false; 
-                }
-                if (!SQL_SUCCEEDED(ret)) 
-                { 
-                    statement.Throw();  
-                }
+                CHECK_ODBC_ERROR( ret, statement );
                 if (strLen_or_IndPtr == SQL_NULL_DATA) 
                 {
                     resultset->SetColumn(make_shared<NullColumn>());
@@ -516,54 +371,111 @@ namespace mssql
                 resultset->SetColumn( make_shared<TimestampColumn>( datetime ));
             }
             break;
-        case SQL_GUID:
         default:
-            {
-                // TODO: how to figure out the size?
-                vector<wchar_t> buffer(8192+1);
-                SQLRETURN ret = SQLGetData(statement, column + 1, SQL_C_WCHAR, buffer.data(), 8192*sizeof(wchar_t), &strLen_or_IndPtr);
-                if (ret == SQL_STILL_EXECUTING) 
-                { 
-                    return false; 
-                }
-                if (!SQL_SUCCEEDED(ret)) 
-                { 
-                    statement.Throw();  
-                }
-                                
-                resultset->SetColumn(make_shared<StringColumn>(buffer.data(), false));
-            }
-            break;
+            // this shouldn't ever be hit.  Every T-SQL type should be covered above.
+            assert( false );
+            return false;
         }
 
         return true;
     }
 
-    bool OdbcConnection::TryReadNextResult()
+    bool OdbcConnection::TryReadString( bool binary, int column )
     {
-        if (executionState != NextResults)
-        {            
-            throw OdbcException("The connection is in an invalid state");
+        SQLLEN display_size = 0;
+        unique_ptr<StringColumn::StringValue> value( new StringColumn::StringValue() );
+        SQLLEN value_len = 0;
+        SQLRETURN r = SQL_SUCCESS;
+
+        r = SQLColAttribute( statement, column + 1, SQL_DESC_DISPLAY_SIZE, NULL, 0, NULL, &display_size );
+        CHECK_ODBC_ERROR( r, statement );
+
+        // when a field type is LOB, we read a packet at time and pass that back.
+        if( display_size == 0 || display_size == std::numeric_limits<int>::max() || 
+            display_size == std::numeric_limits<int>::max() >> 1 || 
+            display_size == std::numeric_limits<unsigned long>::max() - 1 ) {
+
+            bool more = false;
+
+            value_len = LOB_PACKET_SIZE + 1;
+
+            value->resize( value_len );
+
+            SQLRETURN r = SQLGetData( statement, column + 1, SQL_C_WCHAR, value->data(), value_len * 
+                sizeof( StringColumn::StringValue::value_type ), &value_len );
+
+            CHECK_ODBC_NO_DATA( r, statement );
+            CHECK_ODBC_ERROR( r, statement );
+
+            if( value_len == SQL_NULL_DATA ) {
+
+                resultset->SetColumn( make_shared<NullColumn>());
+                return true;          
+            }
+
+            // an unknown amount is left on the field so no total was returned
+            if( value_len == SQL_NO_TOTAL || value_len / sizeof( StringColumn::StringValue::value_type ) > LOB_PACKET_SIZE ) {
+
+                more = true;
+                value->resize( LOB_PACKET_SIZE );
+            }
+            else {
+
+                // value_len is in bytes
+                value->resize( value_len / sizeof( StringColumn::StringValue::value_type ));
+                more = false;
+            }
+
+            resultset->SetColumn( make_shared<StringColumn>( value, more ));
+
+            return true;
+        }
+        else if( display_size >= 1 && display_size <= SQL_SERVER_MAX_STRING_SIZE ) {
+
+            display_size++;                 // increment for null terminator
+            value->resize( display_size );
+
+            SQLRETURN r = SQLGetData( statement, column + 1, SQL_C_WCHAR, value->data(), display_size * 
+                                      sizeof( StringColumn::StringValue::value_type ), &value_len );
+            CHECK_ODBC_ERROR( r, statement );
+            CHECK_ODBC_NO_DATA( r, statement );
+
+            if( value_len == SQL_NULL_DATA ) {
+
+                resultset->SetColumn(make_shared<NullColumn>());
+                return true;          
+            }
+
+            assert( value_len % 2 == 0 );   // should always be even
+            value_len /= sizeof( StringColumn::StringValue::value_type );
+
+            assert( value_len >= 0 && value_len <= display_size - 1 );
+            value->resize( value_len );
+
+            resultset->SetColumn( make_shared<StringColumn>( value, false ));
+
+            return true;
+        }
+        else {
+
+            assert( false );
+
         }
 
+        return false;
+    }
+
+    bool OdbcConnection::TryReadNextResult()
+    {
         SQLRETURN ret = SQLMoreResults(statement);
-        if (ret == SQL_STILL_EXECUTING) 
-        { 
-            return false; 
-        }
         if (ret == SQL_NO_DATA) 
         { 
             endOfResults = true;
             statement.Free();
-            executionState = Idle;
             return true;
         }
-        if (!SQL_SUCCEEDED(ret)) 
-        { 
-            statement.Throw();
-        }
+        CHECK_ODBC_ERROR( ret, statement );
 
-        executionState = CountingColumns;
         endOfResults = false;
 
         return StartReadingResults();
@@ -574,44 +486,20 @@ namespace mssql
         // turn off autocommit
         SQLRETURN ret = SQLSetConnectAttr( connection, SQL_ATTR_AUTOCOMMIT, reinterpret_cast<SQLPOINTER>( SQL_AUTOCOMMIT_OFF ),
                                            SQL_IS_UINTEGER );
-        if (ret == SQL_STILL_EXECUTING) 
-        { 
-            return false; 
-        }
-        if (!SQL_SUCCEEDED(ret)) 
-        { 
-            statement.Throw();  
-        }
+        CHECK_ODBC_ERROR( ret, connection );
         return true;
     }
 
     bool OdbcConnection::TryEndTran(SQLSMALLINT completionType)
     {
         SQLRETURN ret = SQLEndTran(SQL_HANDLE_DBC, connection, completionType);
-        if (ret == SQL_STILL_EXECUTING) 
-        { 
-            return false; 
-        }
-        if (!SQL_SUCCEEDED(ret)) 
-        { 
-            statement.Throw();  
-        }
+        CHECK_ODBC_ERROR( ret, connection );
 
         // put the connection back into auto commit mode
         ret = SQLSetConnectAttr( connection, SQL_ATTR_AUTOCOMMIT, reinterpret_cast<SQLPOINTER>( SQL_AUTOCOMMIT_ON ),
                                            SQL_IS_UINTEGER );
-        // TODO: This will not work because calling into TryEndTran again from the callback will fail
-        // when the completion has already finished.
-        if (ret == SQL_STILL_EXECUTING) 
-        { 
-            return false; 
-        }
-        if (!SQL_SUCCEEDED(ret)) 
-        { 
-            statement.Throw();  
-        }
+        CHECK_ODBC_ERROR( ret, connection );
 
         return true;
     }
-
 }

@@ -6,7 +6,7 @@
       'sources': [ 
         'src/Connection.cpp',
         'src/OdbcConnection.cpp',
-        'src/OdbcException.cpp',
+        'src/OdbcError.cpp',
         'src/OdbcOperation.cpp',
         'src/ResultSet.cpp',
         'src/stdafx.cpp',
