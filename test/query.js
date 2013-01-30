@@ -94,6 +94,7 @@ suite('query', function () {
         stmt.on('meta', function (meta) { assert.deepEqual(meta, meta_expected); });
         stmt.on('row', function (idx) { assert(idx == current_row); ++current_row; });
         stmt.on('column', function (idx, data, more) { assert(data.substr(0,3) == 'var'); });
+        stmt.on('table', function (table) { assert(table.rows[0].name.substr(0,3) === 'var'); });
         stmt.on('done', function () { done(); });
         stmt.on('error', function (err) { assert.ifError(err); });
     });
