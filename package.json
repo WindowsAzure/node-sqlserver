@@ -23,7 +23,8 @@
   },
   "devDependencies": {
      "mocha" : "0.14.x",
-     "async" : "0.1.x"
+     "async" : "0.1.x",
+     "assert" : "0.4.x"
   },
   "os" : [ "win32" ],
   "scripts" : {
