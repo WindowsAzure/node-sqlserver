@@ -11,8 +11,8 @@ feedback, fixes and contributions from the community at this very early stage.
 
 The following prerequisites are necessary prior to using the driver:
 
-* Node.js - use the latest version if possible, but it has been tested on node
-0.6.10 and later
+* 32 bit Node.js - use the latest version if possible, but it has been tested on node
+0.6.10 and later. A 32 bit version is required as the driver needs to be built for 32 bit architectures.
 
 * node-gyp - latest version installed globally (npm install -g node-gyp)
 
