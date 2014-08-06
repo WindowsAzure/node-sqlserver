@@ -39,7 +39,7 @@ Or to build the debug version:
     node-gyp build --debug
 
 Then copy the sqlserver.node file from the build\\(Release|Debug) directory to
-the lib directory.  If you would like to use Visual C++ to debug the driver,
+the lib\\native\\win32\\\(ia32|x64\)\\\(0.6|0.8|0.10|etc\) directory depending on the architecture and version of node.js you used to build.  If you would like to use Visual C++ to debug the driver,
 also copy the sqlserver.pdb file from the same directory.
 
 ## Test
