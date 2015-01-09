@@ -155,7 +155,7 @@ namespace mssql
                         binding.param_size = 0;     // max types require 0 precision
                     }
                     else {
-                        binding.param_size = str_len;
+                        binding.param_size = str_len == 0 ? 1 : str_len;
                     }
                     binding.buffer_len = str_len * sizeof( uint16_t );
                     binding.digits = 0;
