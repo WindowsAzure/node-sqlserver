@@ -20,12 +20,12 @@ var config = require('./test-config');
 // version dependent use of existsSync
 var version = process.version.split('.');
 
-if( version[0] != 'v0' || ( version[1] != '6' && version[1] != '8' )) {
-  throw new Error( "Tests only run in node.js 0.6.x or 0.8.x" );
+if( version[0] != 'v0' || ( version[1] != '6' && version[1] != '8' && version[1] != '10' )) {
+  throw new Error( "Tests only run in node.js 0.6.x, 0.8.x, or 0.10.x" );
 }
 
 var pathExistsSync;
-if( version[1] == '8' ) {
+if( parseInt(version[1]) >= 8 ) {
   pathExistsSync = fs.existsSync;
 }
 else {
