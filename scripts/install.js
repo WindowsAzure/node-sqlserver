@@ -13,6 +13,10 @@ console.log( "You are downloading Microsoft Driver for Node.js for SQL Server fr
 
 var msiVer = process.version.split(".").slice(0,2).join(".");
 var msiArch = process.arch;
+// if your node version > v0.8, we need to use v0.8
+if (msiVer == "v0.10") {
+  msiVer = "v0.8" ;
+}
 var msiName = "msnodesql-" + package.version + "-" + msiVer + "-" + msiArch + ".msi";
 var msiUrl = {
   host: 'download.microsoft.com',
